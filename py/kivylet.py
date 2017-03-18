@@ -4,6 +4,8 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 import os
+
+from LatLon import Latitude, Longitude, LatLon
 import pandas as pd
 
 
@@ -52,13 +54,15 @@ def prepare_data():
     pairports = pd.read_csv(os.path.join(DIR_ROOT, DIR_CODES, FILE_CODES))
 
     codes = STRANGE_CODES
+    for code in codes:
+        codes[code] = (codes[code], None, None)  # STRANGE_CODES have unknown latitude/longitude
     missing_iata = set()
     flights = []
     airports = defaultdict(lambda: [[], set(), 0])  # outgoing flights, "returnable" airports, starting resolve positions
 
     for _idx, airport in pairports.iterrows():
         if airport.iata_code:
-            codes[airport.iata_code] = airport.iso_country
+            codes[airport.iata_code] = (airport.iso_country, airport.latitude_deg, airport.longitude_deg)
     for _idx, flight in pflights.iterrows():
         if flight.source not in codes:
             missing_iata.add(flight.source)
@@ -67,10 +71,10 @@ def prepare_data():
             missing_iata.add(flight.destination)
             continue
         flights.append({
-            'sc': codes[flight.source],        # source country
-            'dc': codes[flight.destination],   # destination country
-            'sa': flight.source,               # source airport
-            'da': flight.destination,          # destination airport
+            'sc': codes[flight.source][0],      # source country
+            'dc': codes[flight.destination][0], # destination country
+            'sa': flight.source,                # source airport
+            'da': flight.destination,           # destination airport
             'dep': datetime.strptime(flight.local_departure_time, '%Y-%m-%d %H:%M:%S'),
             'arr': datetime.strptime(flight.local_arrival_time, '%Y-%m-%d %H:%M:%S'),
         })
@@ -87,7 +91,7 @@ def prepare_data():
         print 'missing airport codes:', ' '.join(missing_iata)
         print
 
-    return flights, airports
+    return flights, airports, codes
     # airports .. dict of airports, key is airport iata code
     #   airport[0] .. outgoing flights
     #   airport[1] .. "returnable" airports      # seems this doesn't help much at least for small count of series
@@ -95,20 +99,24 @@ def prepare_data():
     # we provide here 2 copies of flights:
     #   1: flights, sorted by date
     #   2: airport[0], sorted by date, filtered (grouped) for outgoing airport
+    # codes
+    #   codes[0] .. country (probably not used later)
+    #   codes[1] .. latitude
+    #   codes[2] .. longitude
 
 
-def generate_required_count(flights, airports):
+def generate_required_count(flights, airports, codes):
     out_no = 0
     # here we cycle through date sorted flights,
     #   so we can move the airports[2] position pointer to skip older flights in airports[0] (~ airport outgoing flights)
     for init_pos, flight1 in enumerate(flights):
         if flight1['sc'] != flight1['dc']:    # is international
-            out_no, stop = generate_based_on_initial_flight(flights, airports, flight1, out_no)
+            out_no, stop = generate_based_on_initial_flight(flights, airports, codes, flight1, out_no)
             if stop:
                 break
 
 
-def generate_based_on_initial_flight(flights, airports, flight1, out_no):
+def generate_based_on_initial_flight(flights, airports, codes, flight1, out_no):
     origin = flight1['sa']
     last_date = flight1['dep'] + timedelta(days=366)   # 1 year; but +24 hours is allowed
     flight_ids = [flight1['idx']]
@@ -118,10 +126,10 @@ def generate_based_on_initial_flight(flights, airports, flight1, out_no):
     flight_departure = allowed_departure(flight1)
     flight_pos_after = flight1['idx']
     # for the initial flight find all possibilities
-    return recursive_generate(flights, airports, flight_ids, countries, flight_airport, flight_country, flight_departure, flight_pos_after, origin, last_date, out_no)
+    return recursive_generate(flights, airports, codes, flight_ids, countries, flight_airport, flight_country, flight_departure, flight_pos_after, origin, last_date, out_no)
 
 
-def recursive_generate(flights, airports, flight_ids, countries, flight_airport, flight_country, flight_departure, flight_pos_after, origin, last_date, out_no):
+def recursive_generate(flights, airports, codes, flight_ids, countries, flight_airport, flight_country, flight_departure, flight_pos_after, origin, last_date, out_no):
     from_idx = airports[flight_airport][2]
     flights_to_resolve = airports[flight_airport][0][from_idx:]   # slicing: skip flights which are sure older
     last_idx_can_be_skipped = -1
@@ -143,12 +151,12 @@ def recursive_generate(flights, airports, flight_ids, countries, flight_airport,
             flight_ids.append(flight['idx'])
             countries.append(flight['sc'])
             if len(flight_ids) >= FLIGHTS_AND_COUNTRIES:
-                out_no = report(flight_ids, flights, out_no)
+                out_no = report(flight_ids, flights, codes, out_no)
                 if out_no >= OUTPUT_CNT:
                     return None, True  # stop all recursive calls
             else:
                 flight_departure = allowed_departure(flight)
-                out_no, stop = recursive_generate(flights, airports, flight_ids, countries, flight['da'], flight['dc'], flight_departure, flight_pos_after, origin, last_date, out_no)
+                out_no, stop = recursive_generate(flights, airports, codes, flight_ids, countries, flight['da'], flight['dc'], flight_departure, flight_pos_after, origin, last_date, out_no)
                 if stop:
                     return None, True  # stop all recursive calls
             flight_ids.pop(-1)
@@ -161,13 +169,22 @@ def allowed_departure(previous_flight):
     return previous_flight['arr'] + timedelta(hours=MIN_HOURS_STAY)
 
 
-def report(flight_ids, flights, out_no):
+def get_distance(sa, da, codes):
+    return LatLon(Latitude(codes[da][1]), Longitude(codes[da][2])).distance(LatLon(Latitude(codes[sa][1]), Longitude(codes[sa][2])))
+
+
+def report(flight_ids, flights, codes, out_no):
     assert len(flight_ids) == FLIGHTS_AND_COUNTRIES
     out_no += 1
+    distance_total = 0
     for idx in flight_ids:
         flight = flights[idx]
-        print '{};{};{};{};{};{}'.format(out_no, flight['sc'], flight['sa'], flight['da'],
-                                         flight['dep'].isoformat()[:16], flight['arr'].isoformat()[:16])
+        distance_part = get_distance(flight['sa'], flight['da'], codes)
+        distance_total += distance_part
+        # speed - we need UTC : pytzwhere (+ shapely)
+        print '{};{};{};{};{};{};{};{}'.format(out_no, flight['sc'], flight['sa'], flight['da'],
+                                         flight['dep'].isoformat()[:16], flight['arr'].isoformat()[:16],
+                                         '%i' % distance_part, '%i' % distance_total)
     return out_no
 
 
