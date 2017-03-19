@@ -4,9 +4,12 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 import os
+import pytz
 
-from LatLon import Latitude, Longitude, LatLon
+from LatLon import Latitude, Longitude, LatLon   # asi lépe geopy
+from timezonefinder import TimezoneFinder
 import pandas as pd
+
 
 
 OUTPUT_CNT = 100             # None or +integer ; how many series we want generate
@@ -42,6 +45,8 @@ STRANGE_CODES = {'PEK': 'CN', 'ONK': 'RU', 'AGM': 'GL', 'FLZ': 'ID',   # not con
                  'AOQ': 'GL', 'SGN': 'VN', 'TWT': 'PH', 'LPF': 'CN',
                  'THD': 'VN'}
 
+tf = TimezoneFinder()
+
 
 def go():
     # time0 = datetime.now()
@@ -61,8 +66,10 @@ def prepare_data():
     airports = defaultdict(lambda: [[], set(), 0])  # outgoing flights, "returnable" airports, starting resolve positions
 
     for _idx, airport in pairports.iterrows():
-        if airport.iata_code:
-            codes[airport.iata_code] = (airport.iso_country, airport.latitude_deg, airport.longitude_deg)
+        if not pd.isnull(airport.iata_code):
+            tzs = tf.timezone_at(lat=airport.latitude_deg, lng=airport.longitude_deg)
+            codes[airport.iata_code] = (airport.iso_country, airport.latitude_deg, airport.longitude_deg, tzs)
+            print(airport.iata_code, airport.iso_country, tzs)
     for _idx, flight in pflights.iterrows():
         if flight.source not in codes:
             missing_iata.add(flight.source)
@@ -181,11 +188,28 @@ def report(flight_ids, flights, codes, out_no):
         flight = flights[idx]
         distance_part = get_distance(flight['sa'], flight['da'], codes)
         distance_total += distance_part
-        # speed - we need UTC : pytzwhere (+ shapely)
-        print '{};{};{};{};{};{};{};{}'.format(out_no, flight['sc'], flight['sa'], flight['da'],
-                                         flight['dep'].isoformat()[:16], flight['arr'].isoformat()[:16],
-                                         '%i' % distance_part, '%i' % distance_total)
+        ldep = flight['dep'].isoformat()[:16]
+        larr = flight['arr'].isoformat()[:16]
+        udep = toUTCs(codes[flight['sa']][3], flight['dep'])
+        uarr = toUTCs(codes[flight['da']][3], flight['arr'])
+        udelta = uarr - udep
+        dur = '%i' % (udelta.seconds / 60)
+        print '{out_no};{sc};{sa};{da};{ldep};{larr};{dur};{spd};{dp};{dtot}'.format(out_no=out_no,
+                                                     sc=flight['sc'], sa=flight['sa'],
+                                                     da=flight['da'],
+                                                     ldep=ldep, larr=larr,
+                                                     dur=dur,
+                                                     spd='%i' % (distance_part * 60. / float(dur)),
+                                                     dp='%i' % distance_part, dtot='%i' % distance_total)
     return out_no
+
+
+def toUTCs(tzs, d):
+    return toUTC(pytz.timezone(tzs), d)
+
+
+def toUTC(tz, d):
+    return tz.normalize(tz.localize(d)).astimezone(pytz.utc)
 
 
 if __name__ == '__main__':
